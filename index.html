@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#101318">
+    <title>League Architect | Football Federation Simulator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Rajdhani:wght@600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="CSS/style.css">
+</head>
+<body>
+    <section id="startScreen" class="start-screen">
+        <div class="start-backdrop"></div>
+        <div class="start-content">
+            <p class="eyebrow">A FOOTBALL FEDERATION SIMULATOR</p>
+            <h1>League <span>Architect</span></h1>
+            <p class="start-description">Rancang kompetisi, tetapkan aturan, dan simulasikan musim sepak bola versimu.</p>
+            <div id="startMenu" class="start-menu">
+                <button class="primary-button start-button" data-start-action="continue">Lanjutkan</button>
+                <button class="secondary-button start-button" data-start-action="new">Mulai Game Baru</button>
+                <button class="secondary-button start-button" data-start-action="editor">Editor Liga</button>
+                <p id="saveHint" class="notice"></p>
+            </div>
+            <div id="setupPanel" class="setup-panel" hidden></div>
+        </div>
+    </section>
+
+    <div class="app-shell" id="appShell" hidden>
+        <aside class="sidebar">
+            <button class="club-mark" data-view="overview" aria-label="Buka ringkasan liga">
+                <span>LIGA</span>
+            </button>
+            <nav class="main-nav" aria-label="Navigasi utama">
+                <button class="nav-item active" data-view="overview" title="Ringkasan"><span>⌂</span><small>Ringkasan</small></button>
+                <button class="nav-item" data-view="teams" title="Tim"><span>♙</span><small>Tim</small></button>
+                <button class="nav-item" data-view="regulations" title="Peraturan"><span>⚙</span><small>Peraturan</small></button>
+                <button class="nav-item" data-view="calendar" title="Kalender"><span>▦</span><small>Kalender</small></button>
+                <button class="nav-item" data-view="records" title="Laporan"><span>▤</span><small>Laporan</small></button>
+                <button class="nav-item" data-view="archive" title="Arsip Musim"><span>◷</span><small>Arsip</small></button>
+                <button class="nav-item" data-view="ratings" title="Rating Tim"><span>★</span><small>Rating</small></button>
+                <button class="nav-item" id="leagueEditorButton" title="Editor Liga — tersedia setelah musim selesai"><span>✎</span><small>Editor</small></button>
+            </nav>
+            <button class="nav-item save-button" id="saveButton" title="Simpan"><span>✓</span><small>Simpan</small></button>
+        </aside>
+
+        <main class="main-content">
+            <header class="topbar">
+                <div>
+                    <p class="eyebrow" id="seasonLabel">Musim 2026/27</p>
+                    <h1 id="pageTitle">Ringkasan Liga</h1>
+                </div>
+                <div class="topbar-actions">
+                    <div class="finance-pill"><span>Kas Federasi</span><strong id="budgetValue">Rp 0</strong></div>
+                    <button class="icon-button" id="resetButton" title="Menu utama" aria-label="Kembali ke menu utama">⌂</button>
+                </div>
+            </header>
+            <div id="app" class="view-container" aria-live="polite"></div>
+        </main>
+    </div>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="JS/app.js"></script>
+</body>
+</html>
