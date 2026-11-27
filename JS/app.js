@@ -2,8 +2,19 @@ const SAVE_KEY = "aosb-league-save-v3";
 const PREVIOUS_SAVE_KEY = "aosb-league-save-v2";
 const MIN_TEAMS = 10;
 const MAX_TEAMS_PER_DIVISION = 20;
-const PLAYER_FIRST_NAMES = ["Ardi", "Bima", "Candra", "Daffa", "Eka", "Fajar", "Galih", "Hadi", "Ilham", "Joko", "Kamal"];
-const PLAYER_LAST_NAMES = ["Santoso", "Wijaya", "Pratama", "Kurniawan", "Permana", "Ramadhan"];
+const DEFAULT_PRIZE_POOL = 5000;
+const PRIZE_POOL_TIER_MULTIPLIER = 0.6;
+const PRIZE_RANK_SHARES = [40, 25, 15, 10, 10];
+const WINTER_TRANSFER_WINDOW_START = 0.45;
+const WINTER_TRANSFER_WINDOW_END = 0.55;
+const PLAYER_NAME_DATABASE = window.PLAYER_NAME_DATABASE;
+if (!PLAYER_NAME_DATABASE ||
+    !Array.isArray(PLAYER_NAME_DATABASE.firstNames) || !PLAYER_NAME_DATABASE.firstNames.length ||
+    !Array.isArray(PLAYER_NAME_DATABASE.lastNames) || !PLAYER_NAME_DATABASE.lastNames.length) {
+    throw new Error("Database nama pemain tidak tersedia atau tidak valid.");
+}
+const PLAYER_FIRST_NAMES = PLAYER_NAME_DATABASE.firstNames;
+const PLAYER_LAST_NAMES = PLAYER_NAME_DATABASE.lastNames;
 const PLAYER_ROLES = ["GK", "RB", "CB", "LB", "CM", "RW", "ST", "LW", "AM"];
 const PLAYER_FITNESS_ROTATION_WEIGHT = 0.25;
 const STARTING_FITNESS_COST = 9;
@@ -28,7 +39,13 @@ const SQUAD_DEPTH_LABELS = {
 const defaultTeamNames = [
     "Bulls", "Color Blind", "ECO", "FC Blade",
     "FC Reasons", "Ftring", "HugHes", "JK Club",
-    "TOTORO", "Velda Gr", "Veldora FC", "White Lion's"
+    "TOTORO", "Velda Gr", "Veldora FC", "White Lion's",
+    "Velox United", "Aethelgard Rovers", "Valhalla", "Astral Vanguard",
+    "Crimson Wyverns", "Shadowfang Guild", "Aetherium Knights", "Aurelia Rovers",
+    "Obsidian Wanderers", "Solaris Athletic", "Valkyrie Albion", "Hyperion",
+    "Silvercrest Hotspur", "Ignis Dynamo", "Celestial Villa", "Iron Clad",
+    "Elysium Sporting", "Aegis Legion", "Chronos Fenrir", "Griffin Palace",
+    "Zephyr Starfall", "Frostbane Solstice", "Onyx Sovereign", "Goshped",
 ];
 
 function getInitials(name) {
@@ -47,6 +64,7 @@ function createTeamSquad(teamName, rating, teamIndex) {
         const variation = Math.floor(seededValue(seed) * 5) - 2;
         const playerRating = Math.max(62, Math.min(92, rating + variation));
         const careerSeed = (teamIndex + 1) * 101 + (index + 1) * 17;
+        const potential = Math.min(95, playerRating + 3 + Math.floor(seededValue(careerSeed + 1) * 13));
         return {
             id: `${teamIndex + 1}-${index + 1}`,
             name: `${PLAYER_FIRST_NAMES[index]} ${PLAYER_LAST_NAMES[(teamIndex + index) % PLAYER_LAST_NAMES.length]}`,
@@ -54,7 +72,8 @@ function createTeamSquad(teamName, rating, teamIndex) {
             rating: playerRating,
             fitness: 92 + Math.floor(seededValue(seed + 4) * 8),
             age: 18 + Math.floor(seededValue(careerSeed) * 15),
-            potential: Math.min(95, playerRating + 3 + Math.floor(seededValue(careerSeed + 1) * 13)),
+            potential,
+            weeklyWage: calculatePlayerWeeklyWage({ rating: playerRating, potential }),
             retirementAge: 36 + Math.floor(seededValue(careerSeed + 2) * 4),
             lastSeasonChange: 0,
             goals: 0,
@@ -62,7 +81,7 @@ function createTeamSquad(teamName, rating, teamIndex) {
             appearances: 0,
             cleanSheets: 0,
             yellowCards: 0,
-            redCards: 0
+            redCards: 0,
         };
     });
 }
@@ -112,6 +131,10 @@ function createInitialState(leagueName, teamNames) {
         fans: 55 + ((index * 9) % 40),
         divisionId: Math.floor(index / MAX_TEAMS_PER_DIVISION) + 1
     }));
+    teams.forEach(team => {
+        team.sponsorIncome = calculateWeeklySponsorIncome(team);
+        team.finance = createClubFinanceLedger("2026/27", team.budget);
+    });
     const state = {
         version: 3,
         leagueName: leagueName.trim(),
@@ -126,7 +149,7 @@ function createInitialState(leagueName, teamNames) {
             foreignPlayers: 5,
             squadLimit: 25,
             salaryCap: 800,
-            transferWindow: "Terbuka",
+            prizePool: DEFAULT_PRIZE_POOL,
             homeAdvantage: "Normal",
             discipline: "Standar",
             promotionCount: 2,
@@ -146,6 +169,8 @@ function createInitialState(leagueName, teamNames) {
         pendingSeasonTransition: null,
         lastMovementSeason: null,
         lastPlayerLifecycle: null,
+        transferWindows: { summer: true, winter: false },
+        lastPrizePoolReport: null,
         playerRetirementHistory: []
     };
     state.rules.divisionMovements = createDefaultDivisionMovements(
@@ -160,6 +185,14 @@ function createInitialState(leagueName, teamNames) {
             .filter(team => team.divisionId === division.id)
             .map(team => team.id);
         return createFixtures(teamIds, division.id, state.season);
+    });
+    state.standings.forEach(team => {
+        team.squad.forEach(player => {
+            if (!Number.isFinite(Number(player.weeklyWage))) {
+                player.weeklyWage = calculatePlayerWeeklyWage(player);
+            }
+        });
+        normalizeClubFinance(team, state.season);
     });
     return state;
 }
@@ -271,6 +304,20 @@ function initializePreviousDivisionRanks(standings, overwrite = false) {
     });
 }
 
+function getSeasonProgressRatioForState(seasonState) {
+    if (!seasonState?.divisions?.length) return 0;
+    const fixtures = Array.isArray(seasonState.fixtures) ? seasonState.fixtures : [];
+    const progress = seasonState.divisionProgress || {};
+    return Math.min(...seasonState.divisions.map(division => {
+        const totalWeeks = Math.max(1, ...fixtures
+            .filter(match => match.divisionId === division.id)
+            .map(match => Number(match.week) || 0));
+        const completedWeeks = Math.min(totalWeeks,
+            Math.max(0, (Number(progress[division.id]) || 1) - 1));
+        return completedWeeks / totalWeeks;
+    }));
+}
+
 function loadState() {
     try {
         const saved = localStorage.getItem(SAVE_KEY) || localStorage.getItem(PREVIOUS_SAVE_KEY);
@@ -279,6 +326,14 @@ function loadState() {
             parsed.version = 3;
             parsed.leagueName = parsed.leagueName || "Liga Nusantara";
             parsed.rules = parsed.rules || {};
+            parsed.rules.salaryCap = Number.isFinite(Number(parsed.rules.salaryCap))
+                ? Math.max(0, Math.min(10000, Number(parsed.rules.salaryCap))) : 800;
+            parsed.rules.prizePool = Number.isFinite(Number(parsed.rules.prizePool))
+                ? Math.max(0, Math.min(1000000, Number(parsed.rules.prizePool)))
+                : DEFAULT_PRIZE_POOL;
+            delete parsed.rules.transferWindow;
+            parsed.federationBudget = Number.isFinite(Number(parsed.federationBudget))
+                ? Math.max(0, Number(parsed.federationBudget)) : 12000;
             parsed.rules.promotionCount = Number.isFinite(parsed.rules.promotionCount)
                 ? parsed.rules.promotionCount : 2;
             parsed.rules.relegationCount = Number.isFinite(parsed.rules.relegationCount)
@@ -301,6 +356,9 @@ function loadState() {
                 parsed.pendingSeasonTransition = null;
             }
             if (!parsed.lastMovementSeason) parsed.lastMovementSeason = parsed.season;
+            if (!parsed.lastPrizePoolReport || !Array.isArray(parsed.lastPrizePoolReport.divisions)) {
+                parsed.lastPrizePoolReport = null;
+            }
             if (!parsed.divisions) {
                 const divisionCount = Math.ceil(parsed.standings.length / MAX_TEAMS_PER_DIVISION);
                 parsed.divisions = Array.from({ length: divisionCount }, (_, index) => ({
@@ -322,6 +380,10 @@ function loadState() {
                 team.rankingPoints = Number(team.rankingPoints) || (1000 + (team.rating - 68) * 24);
                 team.previousRankingPoints = Number(team.previousRankingPoints) || team.rankingPoints;
                 team.rankingChange = Number(team.rankingChange) || 0;
+                team.budget = Number.isFinite(Number(team.budget))
+                    ? Number(team.budget) : 1800 + ((index * 350) % 2000);
+                team.fans = Number.isFinite(Number(team.fans))
+                    ? Math.max(0, Number(team.fans)) : 55 + ((index * 9) % 40);
                 team.previousGlobalRank = Number(team.previousGlobalRank) || (index + 1);
                 team.globalRank = Number(team.globalRank) || (index + 1);
                 team.squad = Array.isArray(team.squad) && team.squad.length
@@ -342,19 +404,20 @@ function loadState() {
                     player.age = Number.isFinite(Number(player.age))
                         ? Number(player.age)
                         : 18 + Math.floor(seededValue(careerSeed) * 15);
-                    player.potential = Math.max(
-                        player.rating,
-                        Number(player.potential) || Math.min(
-                            95,
-                            player.rating + 3 + Math.floor(seededValue(careerSeed + 1) * 13)
-                        )
-                    );
+                    const savedPotential = Number(player.potential);
+                    player.potential = Number.isFinite(savedPotential)
+                        ? Math.max(0, Math.min(100, savedPotential))
+                        : Math.min(95, player.rating + 3 + Math.floor(seededValue(careerSeed + 1) * 13));
                     player.retirementAge = Math.max(
                         player.age + 1,
                         Number(player.retirementAge) || 36 + Math.floor(seededValue(careerSeed + 2) * 4)
                     );
                     player.lastSeasonChange = Number(player.lastSeasonChange) || 0;
+                    player.weeklyWage = Number.isFinite(Number(player.weeklyWage))
+                        ? Math.max(0, Number(player.weeklyWage))
+                        : calculatePlayerWeeklyWage(player);
                 });
+                normalizeClubFinance(team, parsed.season);
                 const lastSequence = team.squad.reduce((max, player) => {
                     const match = /-(\d+)$/.exec(String(player.id));
                     return match ? Math.max(max, Number(match[1])) : max;
@@ -368,6 +431,14 @@ function loadState() {
                 parsed.divisionProgress[division.id] =
                     parsed.divisionProgress[division.id] || 1;
             });
+            if (!parsed.transferWindows ||
+                typeof parsed.transferWindows.summer !== "boolean" ||
+                typeof parsed.transferWindows.winter !== "boolean") {
+                parsed.transferWindows = {
+                    summer: true,
+                    winter: getSeasonProgressRatioForState(parsed) >= WINTER_TRANSFER_WINDOW_START
+                };
+            }
             if (parsed.fixtures) {
                 parsed.fixtures.forEach(match => {
                     if (!match.divisionId) {
@@ -428,6 +499,45 @@ function isSeasonComplete() {
     });
 }
 
+function getSeasonProgressRatio() {
+    return getSeasonProgressRatioForState(state);
+}
+
+function getTransferWindowStatus() {
+    if (state.pendingSeasonTransition && isSeasonComplete()) {
+        return {
+            window: "summer",
+            label: "Musim panas · menunggu rollover",
+            detail: "AI melakukan transfer otomatis saat musim baru dimulai."
+        };
+    }
+
+    const progress = getSeasonProgressRatio();
+    if (progress >= WINTER_TRANSFER_WINDOW_START &&
+        progress <= WINTER_TRANSFER_WINDOW_END) {
+        const processed = Boolean(state.transferWindows?.winter);
+        return {
+            window: processed ? null : "winter",
+            label: processed ? "Musim dingin · transfer diproses" : "Musim dingin · aktif",
+            detail: processed
+                ? "Transfer AI untuk jendela ini sudah dijalankan; jendela berakhir setelah melewati pertengahan musim."
+                : "AI akan melakukan transfer otomatis pada jendela pertengahan musim."
+        };
+    }
+    if (progress < WINTER_TRANSFER_WINDOW_START) {
+        return {
+            window: null,
+            label: "Ditutup",
+            detail: "Jendela musim dingin terbuka otomatis saat semua kasta mencapai pertengahan musim."
+        };
+    }
+    return {
+        window: null,
+        label: "Ditutup",
+        detail: "Jendela berikutnya adalah musim panas saat pergantian musim."
+    };
+}
+
 function canEditLeague() {
     return isSeasonComplete() && !state.pendingSeasonTransition;
 }
@@ -469,14 +579,16 @@ function normalizeDivisionMovements(divisions) {
     const existing = state?.rules?.divisionMovements || [];
     return divisions.slice(0, -1).map((division, index) => {
         const saved = existing[index] || {};
+        const promotedCount = Number.isFinite(Number(saved.promotedCount)) ? Math.max(0, Number(saved.promotedCount)) : 2;
+        const relegatedCount = Number.isFinite(Number(saved.relegatedCount)) ? Math.max(0, Number(saved.relegatedCount)) : 2;
         return {
             upperDivisionId: division.id,
             lowerDivisionId: division.id + 1,
             mode: ["auto", "internal_playoff", "cross_playoff"].includes(saved.mode) ? saved.mode : "auto",
-            promotedCount: Number.isFinite(Number(saved.promotedCount)) ? Math.max(0, Number(saved.promotedCount)) : 2,
-            relegatedCount: Number.isFinite(Number(saved.relegatedCount)) ? Math.max(0, Number(saved.relegatedCount)) : 2,
+            promotedCount,
+            relegatedCount,
             playoffSpots: Number.isFinite(Number(saved.playoffSpots)) ? Math.max(0, Number(saved.playoffSpots)) : 0,
-            crossPlayoffPosition: Math.max(1, Number(saved.crossPlayoffPosition) || 3)
+            crossPlayoffPosition: Math.max(promotedCount, relegatedCount) + 1
         };
     });
 }
@@ -496,18 +608,102 @@ function reconcileMovementDraft(divisions, existingMovements, divisionSizes = {}
     });
 }
 
+function getCrossPlayoffPosition(movement) {
+    return Math.max(
+        Number(movement.promotedCount) || 0,
+        Number(movement.relegatedCount) || 0
+    ) + 1;
+}
+
+function renderMovementRuleExplanation(movement) {
+    const upperDivisionId = movement.upperDivisionId;
+    const lowerDivisionId = movement.lowerDivisionId;
+    const promotedCount = Number(movement.promotedCount) || 0;
+    const relegatedCount = Number(movement.relegatedCount) || 0;
+    const rankRange = (first, last) => first === last
+        ? `peringkat ke-${first}`
+        : `peringkat ${first}–${last}`;
+    const promotionStep = promotedCount
+        ? `${rankRange(1, promotedCount)} Kasta ${lowerDivisionId} naik langsung ke Kasta ${upperDivisionId}.`
+        : `Tidak ada promosi langsung dari Kasta ${lowerDivisionId}.`;
+    const relegationStep = relegatedCount
+        ? `${relegatedCount} klub terbawah Kasta ${upperDivisionId} turun ke Kasta ${lowerDivisionId}.`
+        : `Tidak ada degradasi langsung dari Kasta ${upperDivisionId}.`;
+
+    if (movement.mode === "internal_playoff") {
+        const playoffSpots = Number(movement.playoffSpots) || 0;
+        const playoffStart = promotedCount + 1;
+        const playoffEnd = promotedCount + playoffSpots;
+        const playoffRange = playoffStart === playoffEnd
+            ? `peringkat ke-${playoffStart}`
+            : `peringkat ${playoffStart}–${playoffEnd}`;
+        return `<ol>
+            <li>${promotionStep}</li>
+            <li>${playoffSpots
+                ? `${playoffRange} Kasta ${lowerDivisionId} mengikuti play-off internal. Pemenangnya mendapat satu tempat promosi tambahan.`
+                : "Belum ada peserta play-off. Tentukan minimal dua peserta untuk mengaktifkan play-off internal."}</li>
+            <li>${relegationStep} Jumlahnya harus sama dengan promosi langsung ditambah satu pemenang play-off.</li>
+        </ol>`;
+    }
+
+    if (movement.mode === "cross_playoff") {
+        const position = getCrossPlayoffPosition(movement);
+        return `<ol>
+            <li>${promotionStep}</li>
+            <li>${relegationStep}</li>
+            <li>Sistem otomatis memilih peringkat ke-${position} dari atas di Kasta ${lowerDivisionId} untuk menghadapi peringkat ke-${position} dari bawah di Kasta ${upperDivisionId}. Pemenang bermain di Kasta ${upperDivisionId} musim berikutnya.</li>
+            <li>Jumlah promosi dan degradasi langsung harus sama.</li>
+        </ol>`;
+    }
+
+    return `<ol>
+        <li>${promotionStep}</li>
+        <li>${relegationStep}</li>
+        <li>Jumlah klub naik dan turun harus sama agar ukuran kedua kasta tetap seimbang.</li>
+    </ol>`;
+}
+
+function getMovementRuleSuccessMessage(movement) {
+    if (movement.mode === "internal_playoff") {
+        return "Peserta play-off tersedia dan jumlah klub naik/turun seimbang.";
+    }
+    if (movement.mode === "cross_playoff") {
+        return "Posisi penantang tersedia dan jumlah promosi/degradasi langsung seimbang.";
+    }
+    return "Jumlah promosi dan degradasi seimbang.";
+}
+
+function updateMovementRuleFeedback(index) {
+    const movement = movementDraft[index];
+    const card = document.querySelector(`[data-movement-rule="${index}"]`);
+    if (!movement || !card) return;
+
+    card.querySelector(".movement-rule-explanation").innerHTML =
+        renderMovementRuleExplanation(movement);
+    const error = validateDivisionMovementRules(
+        [movement],
+        getDraftDivisionSizes(editorDraft)
+    );
+    const validation = card.querySelector(".movement-rule-validation");
+    validation.classList.toggle("invalid", !!error);
+    validation.classList.toggle("valid", !error);
+    validation.textContent = error || getMovementRuleSuccessMessage(movement);
+}
+
 function normalizeLoadedDivisionMovements(parsedState) {
     const existing = parsedState.rules.divisionMovements || [];
     return parsedState.divisions.slice(0, -1).map((division, index) => {
         const saved = existing[index] || {};
+        const promotedCount = Number.isFinite(Number(saved.promotedCount)) ? Math.max(0, Number(saved.promotedCount)) : 2;
+        const relegatedCount = Number.isFinite(Number(saved.relegatedCount)) ? Math.max(0, Number(saved.relegatedCount)) : 2;
         return {
             upperDivisionId: division.id,
             lowerDivisionId: division.id + 1,
             mode: ["auto", "internal_playoff", "cross_playoff"].includes(saved.mode) ? saved.mode : "auto",
-            promotedCount: Number.isFinite(Number(saved.promotedCount)) ? Math.max(0, Number(saved.promotedCount)) : 2,
-            relegatedCount: Number.isFinite(Number(saved.relegatedCount)) ? Math.max(0, Number(saved.relegatedCount)) : 2,
+            promotedCount,
+            relegatedCount,
             playoffSpots: Number.isFinite(Number(saved.playoffSpots)) ? Math.max(0, Number(saved.playoffSpots)) : 0,
-            crossPlayoffPosition: Number.isFinite(Number(saved.crossPlayoffPosition)) ? Math.max(1, Number(saved.crossPlayoffPosition)) : 3
+            crossPlayoffPosition: Math.max(promotedCount, relegatedCount) + 1
         };
     });
 }
@@ -576,14 +772,12 @@ function validateDivisionMovementRules(rules, divisionSizes, standings = null) {
             continue;
         }
         if (rule.mode === "cross_playoff") {
+            const crossPlayoffPosition = getCrossPlayoffPosition(rule);
             if (rule.promotedCount !== rule.relegatedCount) {
                 return `${prefix} promosi otomatis dan degradasi otomatis harus sama jumlahnya.`;
             }
-            if (rule.crossPlayoffPosition <= rule.promotedCount ||
-                rule.crossPlayoffPosition > lowerSize ||
-                rule.crossPlayoffPosition <= rule.relegatedCount ||
-                rule.crossPlayoffPosition > upperSize) {
-                return `${prefix} posisi play-off harus tersedia dan tidak boleh bentrok dengan slot otomatis.`;
+            if (crossPlayoffPosition > lowerSize || crossPlayoffPosition > upperSize) {
+                return `${prefix} tidak tersedia klub penantang setelah slot otomatis. Kurangi jumlah promosi/degradasi langsung atau pilih metode lain.`;
             }
             const upper = rankedDivisions.get(rule.upperDivisionId) || [];
             const lower = rankedDivisions.get(rule.lowerDivisionId) || [];
@@ -591,7 +785,7 @@ function validateDivisionMovementRules(rules, divisionSizes, standings = null) {
                 rule.upperDivisionId,
                 [
                     ...(rule.relegatedCount > 0 ? upper.slice(-rule.relegatedCount) : []),
-                    upper[upper.length - rule.crossPlayoffPosition]
+                    upper[upper.length - crossPlayoffPosition]
                 ],
                 `${rule.upperDivisionId}/${rule.lowerDivisionId}`
             );
@@ -599,7 +793,7 @@ function validateDivisionMovementRules(rules, divisionSizes, standings = null) {
                 rule.lowerDivisionId,
                 [
                     ...lower.slice(0, rule.promotedCount),
-                    lower[rule.crossPlayoffPosition - 1]
+                    lower[crossPlayoffPosition - 1]
                 ],
                 `${rule.upperDivisionId}/${rule.lowerDivisionId}`
             );
@@ -661,6 +855,115 @@ function escapeHtml(value) {
 
 function formatMoney(value) {
     return `Rp ${value >= 1000 ? (value / 1000).toFixed(value % 1000 ? 1 : 0) + " M" : value + " Jt"}`;
+}
+
+function calculatePlayerWeeklyWage(player) {
+    const rating = Math.max(0, Number(player.rating) || 0);
+    const potential = Number(player.potential);
+    const potentialGap = Number.isFinite(potential) ? Math.max(0, potential - rating) : 0;
+    return Math.max(5, Math.round(8 + rating * 0.35 + potentialGap * 0.15));
+}
+
+function calculateWeeklySponsorIncome(team) {
+    const fans = Math.max(0, Number(team.fans) || 0);
+    const rating = Math.max(0, Number(team.rating) || 0);
+    const divisionId = Math.max(1, Number(team.divisionId) || 1);
+    return Math.round(30 + fans * 1.5 + rating * 1.1 + Math.max(0, 3 - divisionId) * 50);
+}
+
+function createClubFinanceLedger(season, openingBudget = 0) {
+    return {
+        season,
+        openingBudget: Number(openingBudget) || 0,
+        sponsorIncome: 0,
+        ticketIncome: 0,
+        salaryExpenses: 0,
+        prizeMoney: 0,
+        transferIncome: 0,
+        transferExpenses: 0,
+        lastWeek: {
+            sponsorIncome: 0,
+            ticketIncome: 0,
+            salaryExpenses: 0,
+            net: 0
+        }
+    };
+}
+
+function normalizeClubFinance(team, season) {
+    if (!Number.isFinite(Number(team.sponsorIncome))) {
+        team.sponsorIncome = calculateWeeklySponsorIncome(team);
+    }
+    if (!team.finance || typeof team.finance !== "object" || Array.isArray(team.finance)) {
+        team.finance = createClubFinanceLedger(season, team.budget);
+        return team.finance;
+    }
+
+    const finance = team.finance;
+    finance.season = finance.season || season;
+    finance.openingBudget = Number.isFinite(Number(finance.openingBudget))
+        ? Number(finance.openingBudget) : Number(team.budget) || 0;
+    ["sponsorIncome", "ticketIncome", "salaryExpenses", "prizeMoney", "transferIncome", "transferExpenses"]
+        .forEach(key => {
+            finance[key] = Number.isFinite(Number(finance[key])) ? Number(finance[key]) : 0;
+        });
+    const lastWeek = finance.lastWeek && typeof finance.lastWeek === "object"
+        ? finance.lastWeek : {};
+    finance.lastWeek = {
+        sponsorIncome: Number(lastWeek.sponsorIncome) || 0,
+        ticketIncome: Number(lastWeek.ticketIncome) || 0,
+        salaryExpenses: Number(lastWeek.salaryExpenses) || 0,
+        net: Number(lastWeek.net) || 0
+    };
+    return finance;
+}
+
+function getTeamWeeklyPayroll(team) {
+    return team.squad.reduce((total, player) =>
+        total + Math.max(0, Number(player.weeklyWage) || 0), 0);
+}
+
+function buildSeasonFinanceRecords() {
+    return state.standings.map(team => {
+        const finance = normalizeClubFinance(team, state.season);
+        return {
+            teamId: team.id,
+            teamName: team.name,
+            divisionId: team.divisionId,
+            openingBudget: finance.openingBudget,
+            closingBudget: Number(team.budget) || 0,
+            sponsorIncome: finance.sponsorIncome,
+            ticketIncome: finance.ticketIncome,
+            salaryExpenses: finance.salaryExpenses,
+            prizeMoney: finance.prizeMoney,
+            transferIncome: finance.transferIncome,
+            transferExpenses: finance.transferExpenses,
+            weeklyPayroll: getTeamWeeklyPayroll(team)
+        };
+    });
+}
+
+function processClubWeeklyFinances(divisionId, weekFixtures) {
+    const homeTeamIds = new Set(weekFixtures.map(match => match.homeId));
+    return state.standings
+        .filter(team => team.divisionId === divisionId)
+        .map(team => {
+            const finance = normalizeClubFinance(team, state.season);
+            const sponsorIncome = calculateWeeklySponsorIncome(team);
+            const ticketIncome = homeTeamIds.has(team.id)
+                ? Math.round(Math.max(0, Number(team.fans) || 0) * 15)
+                : 0;
+            const salaryExpenses = getTeamWeeklyPayroll(team);
+            const net = sponsorIncome + ticketIncome - salaryExpenses;
+
+            team.sponsorIncome = sponsorIncome;
+            team.budget = (Number(team.budget) || 0) + net;
+            finance.sponsorIncome += sponsorIncome;
+            finance.ticketIncome += ticketIncome;
+            finance.salaryExpenses += salaryExpenses;
+            finance.lastWeek = { sponsorIncome, ticketIncome, salaryExpenses, net };
+            return { teamId: team.id, sponsorIncome, ticketIncome, salaryExpenses, net };
+        });
 }
 
 function getTeam(id) {
@@ -907,15 +1210,42 @@ function renderRatingBar(label, value) {
 }
 
 function getMovementZone(index, divisionTeamCount) {
-    const rule = (state.rules?.divisionMovements || [])
-        .find(item =>
-            item.upperDivisionId === activeDivisionId ||
-            item.lowerDivisionId === activeDivisionId);
-    if (!rule) return "";
-    if (activeDivisionId > 1 && index < (rule.promotedCount || 0)) return "promotion";
-    if (activeDivisionId < state.divisions.length &&
-        index >= divisionTeamCount - (rule.relegatedCount || 0)) return "relegation";
-    return "";
+    const zones = new Set();
+    const rules = (state.rules?.divisionMovements || []).filter(rule =>
+        rule.upperDivisionId === activeDivisionId ||
+        rule.lowerDivisionId === activeDivisionId);
+
+    rules.forEach(rule => {
+        const promotedCount = Number(rule.promotedCount) || 0;
+        const relegatedCount = Number(rule.relegatedCount) || 0;
+        const playoffSpots = Number(rule.playoffSpots) || 0;
+        const crossPlayoffPosition = getCrossPlayoffPosition(rule);
+
+        if (rule.lowerDivisionId === activeDivisionId) {
+            if (index < promotedCount) zones.add("promotion");
+            if (rule.mode === "internal_playoff" &&
+                index >= promotedCount &&
+                index < promotedCount + playoffSpots) {
+                zones.add("playoff");
+            }
+            if (rule.mode === "cross_playoff" &&
+                index === crossPlayoffPosition - 1) {
+                zones.add("playoff");
+            }
+        }
+
+        if (rule.upperDivisionId === activeDivisionId) {
+            if (relegatedCount > 0 && index >= divisionTeamCount - relegatedCount) {
+                zones.add("relegation");
+            }
+            if (rule.mode === "cross_playoff" &&
+                index === divisionTeamCount - crossPlayoffPosition) {
+                zones.add("playoff");
+            }
+        }
+    });
+
+    return [...zones].join(" ");
 }
 
 function renderOverview() {
@@ -935,6 +1265,7 @@ function renderOverview() {
     const divisionTeams = state.standings.filter(team => team.divisionId === activeDivisionId);
     const divisionWeek = state.divisionProgress?.[activeDivisionId] || 1;
     const divisionTotalWeeks = Math.max(1, ...divisionFixtures.map(match => match.week));
+    const activeDivisionComplete = divisionWeek > divisionTotalWeeks;
 
     return `
         <div class="division-tabs" aria-label="Pilih kasta">
@@ -959,11 +1290,11 @@ function renderOverview() {
                 </div>
             </section>
             <section class="panel next-match">
-                <div class="panel-header"><h2>Kendali Liga</h2><span class="notice">${state.rules.transferWindow}</span></div>
+                <div class="panel-header"><h2>Kendali Liga</h2><span class="notice">${getTransferWindowStatus().label}</span></div>
                 <div class="panel-body">
-                    <p class="notice">Simulasikan seluruh pertandingan ${activeDivision.name} pada pekan ${divisionWeek}.</p>
-                    <button class="primary-button" id="simulateWeek" style="width:100%" ${divisionWeek > divisionTotalWeeks ? "disabled" : ""}>
-                        ${divisionWeek > divisionTotalWeeks ? "Musim Selesai" : `Simulasikan Pekan ${divisionWeek}`}
+                    <p class="notice">Satu simulasi memajukan semua kasta${activeDivisionComplete && !seasonComplete ? ` · ${activeDivision.name} sudah selesai, kasta lain tetap berjalan` : ""}.</p>
+                    <button class="primary-button" id="simulateWeek" style="width:100%" ${seasonComplete ? "disabled" : ""}>
+                        ${seasonComplete ? "Musim Selesai" : "Simulasikan Pekan Berikutnya · Semua Kasta"}
                     </button>
                     ${seasonComplete && state.pendingSeasonTransition ? `
                         <button class="secondary-button" id="startNextSeason" style="width:100%;margin-top:8px">Konfirmasi & Mulai Musim Baru</button>
@@ -976,11 +1307,13 @@ function renderOverview() {
             </section>
             ${seasonComplete && state.pendingSeasonTransition ? renderSeasonTransitionSummary() : ""}
             ${renderPlayerLifecycleSummary(activeDivisionId)}
+            ${renderPrizePoolSummary(activeDivisionId)}
             <section class="panel">
                 <div class="panel-header"><h2>Klasemen Liga</h2><button class="secondary-button" data-go="calendar">Kalender</button></div>
                 ${renderBroadcastTable(sorted)}
             </section>
-            <section class="panel">
+            <div class="overview-side-stack">
+            <section class="panel overview-latest-results">
                 <div class="panel-header"><h2>Hasil Terbaru</h2></div>
                 <div class="panel-body">
                     ${latest.length ? latest.map(match => `
@@ -991,6 +1324,8 @@ function renderOverview() {
                         </div>`).join("") : `<p class="notice">Belum ada pertandingan dimainkan.</p>`}
                 </div>
             </section>
+            ${renderOverviewPlayerLeaderboards()}
+            </div>
         </div>`;
 }
 
@@ -1000,13 +1335,15 @@ function renderPlayerLifecycleSummary(divisionId) {
     const clubReports = report.clubs.filter(club => getTeam(club.teamId)?.divisionId === divisionId);
     const growth = clubReports.flatMap(club => club.growth.map(player => ({
         type: "OVR naik",
-        detail: `${player.name} (${club.teamName}) · ${player.from} → ${player.to}`,
-        className: "growth"
+        detail: `${player.name} (${club.teamName}) · ${player.from} → ${player.to}${player.reason ? ` · ${player.reason}` : ""}`,
+        className: "growth",
+        priority: Math.abs(player.to - player.from)
     })));
     const declines = clubReports.flatMap(club => club.declines.map(player => ({
         type: "OVR turun",
-        detail: `${player.name} (${club.teamName}) · ${player.from} → ${player.to}`,
-        className: "decline"
+        detail: `${player.name} (${club.teamName}) · ${player.from} → ${player.to}${player.reason ? ` · ${player.reason}` : ""}`,
+        className: "decline",
+        priority: Math.abs(player.to - player.from)
     })));
     const retirements = clubReports.flatMap(club => club.retirements.map(player => ({
         type: "Pensiun",
@@ -1018,7 +1355,17 @@ function renderPlayerLifecycleSummary(divisionId) {
         detail: `${player.name} (${club.teamName}) · ${player.role}, usia ${player.age} · ${player.reason || "Memenuhi kebutuhan skuad"}`,
         className: "arrival"
     })));
-    const activities = [...growth, ...declines, ...retirements, ...arrivals].slice(0, 6);
+    const clubIds = new Set(clubReports.map(club => club.teamId));
+    const transfers = (report.transfers || [])
+        .filter(transfer => clubIds.has(transfer.fromTeamId) || clubIds.has(transfer.toTeamId))
+        .map(transfer => ({
+            type: "Transfer",
+            detail: `${transfer.playerName} (${transfer.role}, OVR ${transfer.rating}) · ${transfer.fromTeamName} → ${transfer.toTeamName} · ${formatMoney(transfer.fee)}`,
+            className: "transfer"
+        }));
+    const activities = [...growth, ...declines, ...retirements, ...arrivals, ...transfers]
+        .sort((a, b) => (b.priority || 0) - (a.priority || 0))
+        .slice(0, 6);
     const count = key => clubReports.reduce((total, club) => total + club[key].length, 0);
 
     return `
@@ -1040,13 +1387,44 @@ function renderPlayerLifecycleSummary(divisionId) {
                             <strong>${escapeHtml(activity.type)}</strong>
                             <span>${escapeHtml(activity.detail)}</span>
                         </div>`).join("")}
-                </div>` : `<p class="notice">Belum ada perubahan pemain di kasta ini.</p>`}
+                </div>` : `<p class="notice">${
+                    report.transferWindowOpen === false
+                        ? "Bursa transfer ditutup; tidak ada klub yang melakukan perpindahan."
+                        : report.transferWindowOpen && !(report.transfers || []).length
+                            ? "Tidak ada transfer yang memenuhi kebutuhan, anggaran, dan batas skuad."
+                            : "Belum ada perubahan pemain di kasta ini."
+                }</p>`}
+            </div>
+        </section>`;
+}
+
+function renderPrizePoolSummary(divisionId) {
+    const report = state.lastPrizePoolReport;
+    const division = report?.divisions.find(item => item.divisionId === divisionId);
+    if (!division) return "";
+    return `
+        <section class="panel prize-pool-summary">
+            <div class="panel-header">
+                <h2>Hadiah Prize Pool · ${escapeHtml(report.season)}</h2>
+                <span class="notice">${escapeHtml(division.divisionName)} · ${formatMoney(division.paidPool)}</span>
+            </div>
+            <div class="panel-body">
+                <p class="notice">${report.funded
+                    ? "Prize pool musim ini telah dibayarkan penuh."
+                    : `Kas federasi tidak mencukupi; dibayarkan ${formatMoney(report.fundedTotal)} dari ${formatMoney(report.requestedTotal)}.`}</p>
+                ${division.awards.length ? division.awards.map(award => `
+                    <div class="list-row">
+                        <div class="shirt">#${award.rank}</div>
+                        <div class="player-name"><strong>${escapeHtml(award.teamName)}</strong><small>Hadiah peringkat ${award.rank}</small></div>
+                        <div class="rating">${formatMoney(award.amount)}</div>
+                    </div>`).join("") : `<p class="notice">Tidak ada klub yang menerima hadiah pada kasta ini.</p>`}
             </div>
         </section>`;
 }
 
 function renderSeasonTransitionSummary() {
     const transition = state.pendingSeasonTransition;
+    const plannedPrizePool = getConfiguredPrizePoolTotal();
     return `
         <section class="panel season-transition-summary">
             <div class="panel-header">
@@ -1086,22 +1464,16 @@ function renderSeasonTransitionSummary() {
                         </div>
                     </div>`;
                 }).join("") : '<p class="notice">Tidak ada perpindahan divisi yang diatur.</p>'}
+                <p class="notice">Prize pool musim ini: ${formatMoney(plannedPrizePool)} dari kas federasi (${formatMoney(state.federationBudget)} tersedia). Jika kas kurang, seluruh hadiah dikurangi secara proporsional.</p>
                 <p class="notice">Jumlah klub tiap kasta akan tetap seimbang. Setelah konfirmasi, jadwal musim baru akan dibuat.</p>
             </div>
         </section>`;
 }
 
 function renderBroadcastTable(sorted) {
-    const movementRule = (state.rules?.divisionMovements || [])
-        .find(item =>
-            item.upperDivisionId === activeDivisionId ||
-            item.lowerDivisionId === activeDivisionId);
-    const promotionCount = activeDivisionId > 1
-        ? Number(movementRule?.promotedCount || 0)
-        : 0;
-    const relegationCount = activeDivisionId < state.divisions.length
-        ? Number(movementRule?.relegatedCount || 0)
-        : 0;
+    const movementZones = sorted.map((_, index) =>
+        getMovementZone(index, sorted.length));
+    const hasZone = target => movementZones.some(zone => zone.split(" ").includes(target));
 
     return `
         <div class="broadcast-scroll">
@@ -1122,11 +1494,7 @@ function renderBroadcastTable(sorted) {
                     : rankChange < 0
                         ? { arrow: "▼", amount: Math.abs(rankChange), className: "down", label: `Turun ${Math.abs(rankChange)} posisi` }
                         : { arrow: "—", amount: "", className: "flat", label: "Posisi tetap" };
-                const zone = index < promotionCount
-                    ? "promotion"
-                    : index >= sorted.length - relegationCount
-                        ? "relegation"
-                        : "";
+                const zone = movementZones[index];
                 return `
                     <div class="broadcast-row ${zone}" role="row">
                         <div class="standing-position">
@@ -1149,9 +1517,10 @@ function renderBroadcastTable(sorted) {
         </div>
         </div>
         <div class="table-legend">
-            ${promotionCount ? '<span><i class="legend-promotion"></i>Zona promosi</span>' : ""}
-            ${relegationCount ? '<span><i class="legend-relegation"></i>Zona degradasi</span>' : ""}
-            ${!promotionCount && !relegationCount ? '<span><i class="legend-neutral"></i>Klasemen liga</span>' : ""}
+            ${hasZone("promotion") ? '<span><i class="legend-promotion"></i>Zona promosi</span>' : ""}
+            ${hasZone("playoff") ? '<span><i class="legend-playoff"></i>Zona play-off promosi</span>' : ""}
+            ${hasZone("relegation") ? '<span><i class="legend-relegation"></i>Zona degradasi</span>' : ""}
+            ${!movementZones.some(Boolean) ? '<span><i class="legend-neutral"></i>Klasemen liga</span>' : ""}
         </div>`;
 }
 
@@ -1175,8 +1544,8 @@ function renderAiDecisionReport(match, side, teamName) {
         }</span>`).join("");
 
     return `<details class="club-match-ai">
-        <summary>Keputusan AI · ${escapeHtml(teamName)} · ${escapeHtml(decision.formation)} · ${decision.rotationCount} rotasi kebugaran</summary>
-        <p class="ai-report-note">AI menilai OVR dan kebugaran untuk mengisi formasi. Pemain inti kehilangan ${STARTING_FITNESS_COST}% kebugaran, sedangkan pemain yang tidak tampil pulih ${BENCH_FITNESS_RECOVERY}%.</p>
+        <summary>Keputusan Pelatih · ${escapeHtml(teamName)} · ${escapeHtml(decision.formation)} · ${decision.rotationCount} rotasi kebugaran</summary>
+        <p class="ai-report-note">Pelatih menilai OVR dan kebugaran untuk mengisi formasi. Pemain inti kehilangan ${STARTING_FITNESS_COST}% kebugaran, sedangkan pemain yang tidak tampil pulih ${BENCH_FITNESS_RECOVERY}%.</p>
         <div class="ai-lineup-list">${starters}</div>
         ${decision.restedCount ? `<div class="ai-rest-report">
             <strong>${decision.restedCount} pemain tidak diturunkan · ${decision.lowFitnessRestedCount} perlu pemulihan</strong>
@@ -1203,6 +1572,9 @@ function renderClubDetail() {
     const form = getTeamForm(team.id);
     const teamProfile = getTeamRatingProfile(team);
     const lineup = selectStartingLineup(team).slice(0, 11);
+    const finance = normalizeClubFinance(team, state.season);
+    const weeklyPayroll = getTeamWeeklyPayroll(team);
+    const overSalaryCap = weeklyPayroll > Number(state.rules.salaryCap);
     const roster = [...team.squad].sort((a, b) =>
         PLAYER_ROLES.indexOf(a.role) - PLAYER_ROLES.indexOf(b.role) ||
         b.rating - a.rating
@@ -1243,6 +1615,25 @@ function renderClubDetail() {
                     <div><span>Peluang menang</span><strong>${teamProfile.winChance}%</strong></div>
                 </div>
             </section>
+            <section class="panel club-finance-panel">
+                <div class="panel-header">
+                    <h2>Keuangan Klub</h2>
+                    <span class="notice">Saldo ${formatMoney(team.budget)}</span>
+                </div>
+                <div class="panel-body club-profile-stats">
+                    <div><span>Sponsor / pekan</span><strong>${formatMoney(team.sponsorIncome)}</strong></div>
+                    <div><span>Tiket musim ini</span><strong>${formatMoney(finance.ticketIncome)}</strong></div>
+                    <div><span>Gaji skuad / pekan</span><strong>${formatMoney(weeklyPayroll)}</strong></div>
+                    <div><span>Batas gaji</span><strong>${formatMoney(state.rules.salaryCap)}</strong></div>
+                    <div><span>Pemasukan sponsor musim ini</span><strong>${formatMoney(finance.sponsorIncome)}</strong></div>
+                    <div><span>Gaji dibayar musim ini</span><strong>${formatMoney(finance.salaryExpenses)}</strong></div>
+                    <div><span>Hadiah musim ini</span><strong>${formatMoney(finance.prizeMoney)}</strong></div>
+                    <div><span>Transfer masuk / keluar</span><strong>${formatMoney(finance.transferIncome)} / ${formatMoney(finance.transferExpenses)}</strong></div>
+                </div>
+                <p class="notice">${overSalaryCap
+                    ? "Total gaji melampaui batas federasi; klub AI tidak akan merekrut pemain dengan gaji yang membuat pelanggaran semakin besar."
+                    : "Gaji dibayar setiap pekan. Pendapatan sponsor diterima tiap pekan, sedangkan tiket masuk dicatat untuk pertandingan kandang."}</p>
+            </section>
             <section class="panel club-form-panel">
                 <div class="panel-header"><h2>Form Terakhir</h2></div>
                 <div class="panel-body club-form">${form.length
@@ -1277,7 +1668,8 @@ function renderClubDetail() {
                             <span class="lineup-role">${escapeHtml(player.role)}</span>
                             <div class="squad-player-info">
                                 <strong>${escapeHtml(player.name)}</strong>
-                                <small>Usia ${player.age} · Kebugaran ${player.fitness}% · Potensi ${player.potential}</small>
+                                <small>Usia ${player.age} · Kebugaran ${player.fitness}% · Potensi ${player.potential} (panduan)</small>
+                                <small>Gaji ${formatMoney(player.weeklyWage)} / pekan</small>
                             </div>
                             <strong class="squad-player-rating">${player.rating}</strong>
                             <span class="squad-player-change ${trend.className}" aria-label="Perubahan OVR">${trend.symbol} ${trend.label}</span>
@@ -1368,6 +1760,7 @@ function renderTeams() {
 
 function renderRegulations() {
     const rules = state.rules;
+    const transferWindow = getTransferWindowStatus();
     return `
         <div class="grid" style="grid-template-columns:minmax(0,1.4fr) 330px">
             <section class="panel">
@@ -1378,8 +1771,10 @@ function renderRegulations() {
                         ["02", "Pemain Asing", `Maksimal ${rules.foreignPlayers} pemain asing per tim`],
                         ["03", "Batas Skuad", `Maksimal ${rules.squadLimit} pemain terdaftar`],
                         ["04", "Disiplin", `Standar sanksi: ${rules.discipline}`],
-                        ["05", "Bursa Transfer", `Status: ${rules.transferWindow}`],
-                        ["06", "Keuntungan Tuan Rumah", `Level: ${rules.homeAdvantage}`]
+                        ["05", "Jendela Transfer", `${transferWindow.label} · jadwal otomatis meniru pola musim panas dan musim dingin Eropa`],
+                        ["06", "Batas Gaji", `${formatMoney(rules.salaryCap)} per klub per pekan`],
+                        ["07", "Prize Pool", `${formatMoney(rules.prizePool)} untuk kasta teratas · kasta berikutnya menerima 60% dari pool kasta di atasnya`],
+                        ["08", "Keuntungan Tuan Rumah", `Level: ${rules.homeAdvantage}`]
                     ].map(item => `<article class="rule-card"><span>${item[0]}</span><div><strong>${item[1]}</strong><small>${item[2]}</small></div></article>`).join("")}
                 </div>
             </section>
@@ -1394,8 +1789,13 @@ function renderRegulations() {
                     <select id="foreignPlayers" class="secondary-button rule-select">${[3,4,5,6].map(n => `<option ${rules.foreignPlayers === n ? "selected" : ""}>${n}</option>`).join("")}</select>
                     <label class="notice">Keuntungan kandang</label>
                     <select id="homeAdvantage" class="secondary-button rule-select">${["Rendah", "Normal", "Tinggi"].map(n => `<option ${rules.homeAdvantage === n ? "selected" : ""}>${n}</option>`).join("")}</select>
-                    <label class="notice">Status transfer</label>
-                    <select id="transferWindow" class="secondary-button rule-select">${["Tertutup", "Terbuka"].map(n => `<option ${rules.transferWindow === n ? "selected" : ""}>${n}</option>`).join("")}</select>
+                    <label class="notice">Jendela transfer otomatis</label>
+                    <p class="notice"><strong>${transferWindow.label}</strong> · ${transferWindow.detail} Jendela musim panas berjalan saat rollover; jendela musim dingin berjalan di sekitar pertengahan musim. Maksimal satu transfer per klub pada setiap jendela.</p>
+                    <label class="notice">Batas gaji mingguan per klub (Rp Juta)</label>
+                    <input id="salaryCap" class="secondary-button rule-select" type="number" min="0" max="10000" step="50" value="${rules.salaryCap}">
+                    <label class="notice">Prize pool kasta teratas per musim (Rp Juta)</label>
+                    <input id="prizePool" class="secondary-button rule-select" type="number" min="0" max="1000000" step="500" value="${rules.prizePool}">
+                    <p class="notice">Pool kasta bawah turun 40% tiap tingkat. Hadiah peringkat 1–5: 40%, 25%, 15%, 10%, dan 10%. Hadiah dibayar saat rollover dari kas federasi.</p>
                     <label class="notice">Standar disiplin</label>
                     <select id="discipline" class="secondary-button rule-select">${["Ringan", "Standar", "Ketat"].map(n => `<option ${rules.discipline === n ? "selected" : ""}>${n}</option>`).join("")}</select>
                     <button class="primary-button" id="saveRules" style="width:100%">Terapkan Peraturan</button>
@@ -1442,26 +1842,7 @@ function renderPlayerLeaderboard() {
         !state.divisions.some(division => division.id === Number(playerLeaderboardDivisionId))) {
         playerLeaderboardDivisionId = "all";
     }
-    const rows = state.standings
-        .filter(team =>
-            playerLeaderboardDivisionId === "all" ||
-            team.divisionId === Number(playerLeaderboardDivisionId))
-        .flatMap(team => team.squad.map(player => ({
-            id: player.id,
-            name: player.name,
-            role: player.role,
-            teamName: team.name,
-            divisionId: team.divisionId,
-            appearances: Number(player.appearances) || 0,
-            rating: Number(player.rating) || 0,
-            value: Number(player[category.id]) || 0
-        })))
-        .sort((a, b) =>
-            b.value - a.value ||
-            b.appearances - a.appearances ||
-            b.rating - a.rating ||
-            a.name.localeCompare(b.name)
-        );
+    const rows = getPlayerLeaderboardRows(category.id, playerLeaderboardDivisionId);
     let rank = 0;
     rows.forEach((row, index) => {
         if (index === 0 || row.value !== rows[index - 1].value) rank = index + 1;
@@ -1504,7 +1885,7 @@ function renderPlayerLeaderboard() {
                                 <td>${escapeHtml(state.divisions.find(division => division.id === player.divisionId)?.name || "")}</td>
                                 <td>${player.appearances}</td>
                                 <td><strong>${player.value}</strong></td>
-                            </tr>`).join("") || '<tr><td colspan="7" class="archive-empty-cell">Belum ada pemain untuk kasta ini.</td></tr>'}
+                            </tr>`).join("") || '<tr><td colspan="7" class="archive-empty-cell">Belum ada pemain dengan statistik ini untuk kasta yang dipilih.</td></tr>'}
                     </tbody>
                 </table>
             </div>
@@ -1512,6 +1893,70 @@ function renderPlayerLeaderboard() {
                 <button class="secondary-button" id="playerLeaderboardPrevious" type="button" ${playerLeaderboardPage === 1 ? "disabled" : ""}>Sebelumnya</button>
                 <span>Halaman ${playerLeaderboardPage} / ${pageCount}</span>
                 <button class="secondary-button" id="playerLeaderboardNext" type="button" ${playerLeaderboardPage === pageCount ? "disabled" : ""}>Berikutnya</button>
+            </div>
+        </section>`;
+}
+
+function getPlayerLeaderboardRows(categoryId, divisionId = "all") {
+    return state.standings
+        .filter(team =>
+            divisionId === "all" ||
+            team.divisionId === Number(divisionId))
+        .flatMap(team => team.squad
+            .filter(player =>
+                (Number(player[categoryId]) || 0) > 0 &&
+                (categoryId !== "cleanSheets" || player.role === "GK"))
+            .map(player => ({
+                id: player.id,
+                name: player.name,
+                role: player.role,
+                teamName: team.name,
+                divisionId: team.divisionId,
+                appearances: Number(player.appearances) || 0,
+                rating: Number(player.rating) || 0,
+                value: Number(player[categoryId]) || 0
+            })))
+        .sort((a, b) =>
+            b.value - a.value ||
+            b.appearances - a.appearances ||
+            b.rating - a.rating ||
+            a.name.localeCompare(b.name)
+        );
+}
+
+function renderOverviewPlayerLeaderboards() {
+    const categories = [
+        { id: "goals", title: "Pencetak Gol" },
+        { id: "assists", title: "Assist" },
+        { id: "cleanSheets", title: "Clean Sheet · Kiper" }
+    ];
+
+    return `
+        <section class="panel overview-player-leaders">
+            <div class="panel-header">
+                <h2>Leaderboard Pemain</h2>
+                <span class="notice">Musim ${escapeHtml(state.season)}</span>
+            </div>
+            <div class="panel-body">
+                <div class="overview-leaderboards">
+                    ${categories.map(category => {
+                        const leaders = getPlayerLeaderboardRows(category.id).slice(0, 5);
+                        return `<section class="overview-leaderboard" data-category="${category.id}">
+                            <h3>${category.title}</h3>
+                            <ol>
+                                ${leaders.map((player, index) => `
+                                    <li class="overview-leaderboard-row" data-player-id="${escapeHtml(player.id)}" data-player-role="${escapeHtml(player.role)}">
+                                        <span class="overview-leaderboard-rank">${index + 1}</span>
+                                        <span class="overview-leaderboard-player">
+                                            <strong>${escapeHtml(player.name)}</strong>
+                                            <small>${escapeHtml(player.teamName)} · ${escapeHtml(state.divisions.find(division => division.id === player.divisionId)?.name || "")}</small>
+                                        </span>
+                                        <b class="overview-leaderboard-value">${player.value}</b>
+                                    </li>`).join("") || '<li class="overview-leaderboard-empty">Belum ada catatan.</li>'}
+                            </ol>
+                        </section>`;
+                    }).join("")}
+                </div>
             </div>
         </section>`;
 }
@@ -1593,14 +2038,14 @@ function renderRecords() {
                 </div>
             </section>
             <section class="panel ai-match-reports" style="grid-column:1/-1">
-                <div class="panel-header"><h2>Laporan Keputusan AI Klub</h2><span class="notice">5 pertandingan terakhir</span></div>
+                <div class="panel-header"><h2>Laporan Keputusan Pelatih Klub</h2><span class="notice">5 pertandingan terakhir</span></div>
                 <div class="panel-body">
                     ${aiMatches.length ? aiMatches.map(match => `
                         <article class="ai-match-report">
                             <strong>Pekan ${match.week} · ${escapeHtml(match.homeShort)} ${match.homeGoals} — ${match.awayGoals} ${escapeHtml(match.awayShort)}</strong>
                             ${renderAiDecisionReport(match, "home", getTeam(match.homeId)?.name || match.homeShort)}
                             ${renderAiDecisionReport(match, "away", getTeam(match.awayId)?.name || match.awayShort)}
-                        </article>`).join("") : `<p class="notice">Laporan keputusan AI akan muncul setelah pertandingan dimainkan.</p>`}
+                        </article>`).join("") : `<p class="notice">Laporan keputusan Federasi akan muncul setelah pertandingan dimainkan.</p>`}
                 </div>
             </section>
             ${renderPlayerLeaderboard()}
@@ -1626,8 +2071,15 @@ function renderSeasonArchive() {
     const division = divisions.find(item => item.id === selectedArchiveDivisionId) || divisions[0];
     if (division) selectedArchiveDivisionId = division.id;
     const teams = divisions.flatMap(item => item.standings || []);
+    const divisionTeams = division?.standings || [];
+    const divisionTeamIds = new Set(divisionTeams.map(team => team.id));
     const teamById = new Map(teams.map(team => [team.id, team]));
     const archivePlayers = archive.players || [];
+    const divisionPlayerCount = archivePlayers.filter(player =>
+        divisionTeamIds.has(player.teamId)).length;
+    const champion = division?.champion ||
+        divisionTeams[0] ||
+        (division?.id === 1 ? archive.champion : null);
     const playerTeams = [...new Map(archivePlayers.map(player => [
         player.teamId,
         { id: player.teamId, name: player.teamName }
@@ -1650,6 +2102,11 @@ function renderSeasonArchive() {
     );
     const movements = archive.movements || [];
     const playoffs = archive.playoffs || [];
+    const transfers = archive.transfers || [];
+    const financeRows = (archive.clubFinances || [])
+        .filter(finance => finance.divisionId === division?.id);
+    const prizeDivision = archive.prizePool?.divisions?.find(item =>
+        item.divisionId === division?.id);
 
     return `
         <div class="archive-page">
@@ -1668,14 +2125,14 @@ function renderSeasonArchive() {
             <section class="panel archive-champion">
                 <div class="archive-champion-mark">🏆</div>
                 <div>
-                    <p class="eyebrow">Juara Liga · Musim ${escapeHtml(archive.season)}</p>
-                    <h2>${escapeHtml(archive.champion?.name || "Belum tersedia")}</h2>
-                    <span class="notice">${escapeHtml(archive.champion?.short || "Arsip musim")}</span>
+                    <p class="eyebrow">Juara ${escapeHtml(division?.name || "Liga")} · Musim ${escapeHtml(archive.season)}</p>
+                    <h2>${escapeHtml(champion?.name || "Belum tersedia")}</h2>
+                    <span class="notice">${escapeHtml(champion?.short || "Arsip musim")}</span>
                 </div>
                 <div class="archive-champion-meta">
-                    <span>${teams.length} klub</span>
-                    <span>${(archive.matches || []).length} pertandingan</span>
-                    <span>${archivePlayers.length} catatan pemain</span>
+                    <span>${divisionTeams.length} klub</span>
+                    <span>${divisionMatches.length} pertandingan</span>
+                    <span>${divisionPlayerCount} catatan pemain</span>
                 </div>
             </section>
             <section class="panel">
@@ -1719,6 +2176,64 @@ function renderSeasonArchive() {
                                 <span class="archive-playoff-icon">⚽</span>
                                 <div><strong>${escapeHtml(playoff.teamAName)} vs ${escapeHtml(playoff.teamBName)}</strong><small>${escapeHtml(playoff.type || "Play-off")} · Pemenang ${escapeHtml(playoff.winnerName)} · ${playoff.finalTeamATotal ?? playoff.teamATotal} — ${playoff.finalTeamBTotal ?? playoff.teamBTotal}</small></div>
                             </div>`).join("") : `<p class="notice">Tidak ada play-off pada musim ini.</p>`}
+                    </div>
+                </section>
+            </div>
+            <section class="panel">
+                <div class="panel-header"><h2>Bursa Transfer</h2><span class="notice">${transfers.length} perpindahan</span></div>
+                <div class="panel-body">
+                    ${transfers.length ? transfers.map(transfer => `
+                        <div class="archive-list-row">
+                            <span class="archive-playoff-icon">↔</span>
+                            <div><strong>${escapeHtml(transfer.playerName)} · ${escapeHtml(transfer.role)} · OVR ${transfer.rating}</strong>
+                                <small>${escapeHtml(transfer.window || "Jendela transfer")} · ${escapeHtml(transfer.fromTeamName)} → ${escapeHtml(transfer.toTeamName)} · Biaya ${formatMoney(transfer.fee)} · ${escapeHtml(transfer.reason)}</small>
+                            </div>
+                        </div>`).join("") : `<p class="notice">Tidak ada transfer yang tercatat pada musim ini.</p>`}
+                </div>
+            </section>
+            <div class="archive-two-column">
+                <section class="panel">
+                    <div class="panel-header">
+                        <h2>Prize Pool · ${escapeHtml(division?.name || "Kasta")}</h2>
+                        <span class="notice">${formatMoney(prizeDivision?.paidPool || 0)} dibayarkan</span>
+                    </div>
+                    <div class="panel-body">
+                        ${prizeDivision?.awards?.length ? prizeDivision.awards.map(award => `
+                            <div class="archive-list-row">
+                                <span class="archive-movement-icon">#${award.rank}</span>
+                                <div><strong>${escapeHtml(award.teamName)}</strong><small>Peringkat ${award.rank} · ${formatMoney(award.amount)}</small></div>
+                            </div>`).join("") : `<p class="notice">${
+                                archive.prizePool
+                                    ? "Tidak ada hadiah yang dibayarkan pada kasta ini."
+                                    : "Data prize pool belum tersedia."
+                            }</p>`}
+                        ${archive.prizePool && !archive.prizePool.funded
+                            ? `<p class="notice">Kas federasi tidak mencukupi; hadiah dibayarkan secara proporsional.</p>`
+                            : ""}
+                    </div>
+                </section>
+                <section class="panel">
+                    <div class="panel-header">
+                        <h2>Keuangan Klub · ${escapeHtml(division?.name || "Kasta")}</h2>
+                        <span class="notice">${financeRows.length} klub</span>
+                    </div>
+                    <div class="archive-table-scroll">
+                        <table class="season-archive-table">
+                            <thead><tr><th>Klub</th><th>Saldo awal</th><th>Sponsor</th><th>Tiket</th><th>Gaji</th><th>Hadiah</th><th>Transfer netto</th><th>Saldo akhir</th></tr></thead>
+                            <tbody>
+                                ${financeRows.map(finance => `
+                                    <tr>
+                                        <td><strong>${escapeHtml(finance.teamName)}</strong></td>
+                                        <td>${formatMoney(finance.openingBudget)}</td>
+                                        <td>${formatMoney(finance.sponsorIncome)}</td>
+                                        <td>${formatMoney(finance.ticketIncome)}</td>
+                                        <td>${formatMoney(finance.salaryExpenses)}</td>
+                                        <td>${formatMoney(finance.prizeMoney)}</td>
+                                        <td>${formatMoney(finance.transferIncome - finance.transferExpenses)}</td>
+                                        <td><strong>${formatMoney(finance.closingBudget)}</strong></td>
+                                    </tr>`).join("") || '<tr><td colspan="8" class="archive-empty-cell">Data keuangan klub tidak tersedia.</td></tr>'}
+                            </tbody>
+                        </table>
                     </div>
                 </section>
             </div>
@@ -1854,43 +2369,58 @@ function renderSetup() {
         movementDraft,
         getDraftDivisionSizes(editorDraft)
     );
-    const movementRows = movementDraft.map((movement, index) => `
-        <article class="movement-rule-card">
+    movementDraft.forEach(movement => {
+        if (movement.mode === "cross_playoff") {
+            movement.crossPlayoffPosition = getCrossPlayoffPosition(movement);
+        }
+    });
+    const movementRows = movementDraft.map((movement, index) => {
+        const movementError = validateDivisionMovementRules(
+            [movement],
+            getDraftDivisionSizes(editorDraft)
+        );
+        return `
+        <article class="movement-rule-card" data-movement-rule="${index}">
             <div class="movement-rule-heading">
-                <strong>Kasta ${movement.lowerDivisionId} → Kasta ${movement.upperDivisionId}</strong>
-                <span>Batas kasta ${movement.upperDivisionId}/${movement.lowerDivisionId}</span>
+                <div>
+                    <span class="movement-rule-kicker">Perpindahan antarkasta</span>
+                    <strong>Kasta ${movement.upperDivisionId} ↔ Kasta ${movement.lowerDivisionId}</strong>
+                </div>
+                <span>Kasta ${movement.upperDivisionId} atas · Kasta ${movement.lowerDivisionId} bawah</span>
             </div>
-            <label>Metode promosi
+            <label class="movement-mode-label">Pilih mekanisme perpindahan
                 <select class="secondary-button movement-mode" data-movement-index="${index}">
-                    <option value="auto" ${movement.mode === "auto" ? "selected" : ""}>Otomatis langsung</option>
-                    <option value="internal_playoff" ${movement.mode === "internal_playoff" ? "selected" : ""}>Play-off internal</option>
-                    <option value="cross_playoff" ${movement.mode === "cross_playoff" ? "selected" : ""}>Play-off lintas kasta</option>
+                    <option value="auto" ${movement.mode === "auto" ? "selected" : ""}>Promosi dan degradasi langsung</option>
+                    <option value="internal_playoff" ${movement.mode === "internal_playoff" ? "selected" : ""}>Play-off promosi di kasta bawah</option>
+                    <option value="cross_playoff" ${movement.mode === "cross_playoff" ? "selected" : ""}>Play-off antara dua kasta</option>
                 </select>
             </label>
             <div class="movement-fields">
-                <label>Auto promosi
+                <label class="movement-field">
+                    <span>Naik langsung</span>
+                    <small>Dari Kasta ${movement.lowerDivisionId}</small>
                     <input type="number" min="0" max="${MAX_TEAMS_PER_DIVISION}" class="movement-promoted" data-movement-index="${index}" value="${movement.promotedCount}">
                 </label>
-                <label>${movement.mode === "internal_playoff" ? "Total degradasi" : "Auto degradasi"}
+                <label class="movement-field">
+                    <span>${movement.mode === "internal_playoff" ? "Total klub turun" : "Turun langsung"}</span>
+                    <small>Dari Kasta ${movement.upperDivisionId}</small>
                     <input type="number" min="0" max="${MAX_TEAMS_PER_DIVISION}" class="movement-relegated" data-movement-index="${index}" value="${movement.relegatedCount}">
                 </label>
                 ${movement.mode === "internal_playoff" ? `
-                    <label>Tim ikut play-off
-                        <input type="number" min="2" max="${MAX_TEAMS_PER_DIVISION}" class="movement-playoff" data-movement-index="${index}" value="${Math.max(2, movement.playoffSpots)}">
-                    </label>` : ""}
-                ${movement.mode === "cross_playoff" ? `
-                    <label>Posisi lintas kasta
-                        <input type="number" min="1" max="${MAX_TEAMS_PER_DIVISION}" class="movement-cross" data-movement-index="${index}" value="${movement.crossPlayoffPosition}">
+                    <label class="movement-field">
+                        <span>Peserta play-off</span>
+                        <small>Posisi setelah promosi langsung</small>
+                        <input type="number" min="2" max="${MAX_TEAMS_PER_DIVISION}" class="movement-playoff" data-movement-index="${index}" value="${movement.playoffSpots}">
                     </label>` : ""}
             </div>
-            <small class="movement-rule-help">
-                ${movement.mode === "internal_playoff"
-                    ? "Pemenang play-off mendapat satu slot promosi tambahan; total degradasi harus sama dengan promosi otomatis + 1."
-                    : movement.mode === "cross_playoff"
-                        ? "Promosi/degradasi otomatis harus seimbang. Posisi play-off tidak boleh bentrok dengan slot otomatis."
-                        : "Jumlah promosi otomatis harus sama dengan jumlah degradasi otomatis."}
-            </small>
-        </article>`).join("");
+            <div class="movement-rule-explanation" aria-live="polite">
+                ${renderMovementRuleExplanation(movement)}
+            </div>
+            <p class="movement-rule-validation ${movementError ? "invalid" : "valid"}" role="status">
+                ${escapeHtml(movementError || getMovementRuleSuccessMessage(movement))}
+            </p>
+        </article>`;
+    }).join("");
     const teamRows = editorDraft.map((team, index) => `
         <div class="team-edit-row">
             <span class="team-edit-index">${String(index + 1).padStart(2, "0")}</span>
@@ -1913,8 +2443,9 @@ function renderSetup() {
             <input id="leagueNameInput" type="text" maxlength="50" required value="${escapeHtml(leagueName)}" placeholder="Contoh: Liga Nusantara">
             <div class="promotion-settings">
                 <section class="movement-rules">
-                    <div class="team-list-heading">
-                        <div><label>Aturan promosi & degradasi</label><small>Dapat diatur berbeda untuk setiap batas kasta</small></div>
+                    <div class="movement-rules-intro">
+                        <h3>Aturan perpindahan kasta</h3>
+                        <p>Setiap kartu mengatur dua kasta yang bersebelahan. Ubah angka untuk menentukan berapa klub yang naik, turun, atau mengikuti play-off.</p>
                     </div>
                     ${movementRows || '<p class="notice">Liga satu kasta tidak memiliki batas promosi/degradasi.</p>'}
                 </section>
@@ -1953,12 +2484,28 @@ function renderSetup() {
             renderSetup();
         });
 
-        document.querySelectorAll(".movement-mode").forEach(select => {
-            select.addEventListener("change", () => {
-                const index = Number(select.dataset.movementIndex);
-                if (movementDraft[index]) movementDraft[index].mode = select.value;
-                renderSetup();
-            });
+    });
+
+    document.querySelectorAll(".movement-mode").forEach(select => {
+        select.addEventListener("change", () => {
+            syncMovementDraft();
+            const index = Number(select.dataset.movementIndex);
+            if (movementDraft[index]) {
+                movementDraft[index].mode = select.value;
+                if (select.value === "cross_playoff") {
+                    movementDraft[index].crossPlayoffPosition = getCrossPlayoffPosition(movementDraft[index]);
+                }
+                if (select.value === "internal_playoff" && movementDraft[index].playoffSpots < 2) {
+                    movementDraft[index].playoffSpots = 2;
+                }
+            }
+            renderSetup();
+        });
+    });
+    document.querySelectorAll(".movement-fields input").forEach(input => {
+        input.addEventListener("input", () => {
+            syncMovementDraft();
+            updateMovementRuleFeedback(Number(input.dataset.movementIndex));
         });
     });
 
@@ -1994,9 +2541,10 @@ function syncMovementDraft() {
         const index = Number(input.dataset.movementIndex);
         if (movementDraft[index]) movementDraft[index].playoffSpots = Number(input.value);
     });
-    document.querySelectorAll(".movement-cross").forEach(input => {
-        const index = Number(input.dataset.movementIndex);
-        if (movementDraft[index]) movementDraft[index].crossPlayoffPosition = Number(input.value);
+    movementDraft.forEach(movement => {
+        if (movement.mode === "cross_playoff") {
+            movement.crossPlayoffPosition = getCrossPlayoffPosition(movement);
+        }
     });
 }
 
@@ -2029,9 +2577,8 @@ function saveLeagueSetup(event) {
         !Number.isInteger(movement.promotedCount) || movement.promotedCount < 0 ||
         !Number.isInteger(movement.relegatedCount) || movement.relegatedCount < 0 ||
         !Number.isInteger(movement.playoffSpots) || movement.playoffSpots < 0 ||
-        !Number.isInteger(movement.crossPlayoffPosition) || movement.crossPlayoffPosition < 1 ||
         !["auto", "internal_playoff", "cross_playoff"].includes(movement.mode))) {
-        error.textContent = "Jumlah promosi, degradasi, dan posisi playoff harus valid.";
+        error.textContent = "Jumlah promosi, degradasi, dan peserta play-off harus valid.";
         return;
     }
     const divisionSizes = {};
@@ -2065,7 +2612,7 @@ function saveLeagueSetup(event) {
         promotedCount: Math.min(movement.promotedCount, MAX_TEAMS_PER_DIVISION),
         relegatedCount: Math.min(movement.relegatedCount, MAX_TEAMS_PER_DIVISION),
         playoffSpots: Math.min(movement.playoffSpots, MAX_TEAMS_PER_DIVISION),
-        crossPlayoffPosition: Math.min(movement.crossPlayoffPosition, MAX_TEAMS_PER_DIVISION)
+        crossPlayoffPosition: getCrossPlayoffPosition(movement)
     }));
 
     saveState(false);
@@ -2116,6 +2663,15 @@ function applyLeagueEdits(leagueName, draft) {
             fans: existing?.fans || (55 + ((index * 9) % 40)),
             p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, pts: 0
         };
+    });
+    state.standings.forEach(team => {
+        team.sponsorIncome = calculateWeeklySponsorIncome(team);
+        team.squad.forEach(player => {
+            if (!Number.isFinite(Number(player.weeklyWage))) {
+                player.weeklyWage = calculatePlayerWeeklyWage(player);
+            }
+        });
+        normalizeClubFinance(team, state.season);
     });
 
     if (rosterChanged) {
@@ -2217,11 +2773,19 @@ function bindViewEvents() {
 
     const saveRulesButton = document.getElementById("saveRules");
     if (saveRulesButton) saveRulesButton.addEventListener("click", () => {
+        const salaryCap = Number(document.getElementById("salaryCap").value);
+        const prizePool = Number(document.getElementById("prizePool").value);
+        if (!Number.isInteger(salaryCap) || salaryCap < 0 || salaryCap > 10000 ||
+            !Number.isInteger(prizePool) || prizePool < 0 || prizePool > 1000000) {
+            showToast("Batas gaji harus 0–10.000 dan prize pool 0–1.000.000; masukkan angka bulat.");
+            return;
+        }
         state.rules.pointsWin = Number(document.getElementById("pointsWin").value);
         state.rules.pointsDraw = Number(document.getElementById("pointsDraw").value);
         state.rules.foreignPlayers = Number(document.getElementById("foreignPlayers").value);
         state.rules.homeAdvantage = document.getElementById("homeAdvantage").value;
-        state.rules.transferWindow = document.getElementById("transferWindow").value;
+        state.rules.salaryCap = salaryCap;
+        state.rules.prizePool = prizePool;
         state.rules.discipline = document.getElementById("discipline").value;
         state.reputation = Math.max(40, Math.min(100,
             state.reputation + (state.rules.discipline === "Ketat" ? 2 : 0)));
@@ -2535,63 +3099,315 @@ function simulateDetailedMatch(home, away, isHome, week) {
 
 function simulateWeek() {
     if (!state.divisionProgress) state.divisionProgress = {};
-    const divisionWeek = state.divisionProgress[activeDivisionId] || 1;
-    const divisionFixtures = state.fixtures
-        .filter(match => match.divisionId === activeDivisionId);
-    const totalWeeks = Math.max(1, ...divisionFixtures.map(match => match.week));
-    if (divisionWeek > totalWeeks) {
-        showToast("Musim telah selesai");
+    const progressBefore = getSeasonProgressRatio();
+    const schedules = state.divisions.map(division => {
+        const divisionWeek = state.divisionProgress[division.id] || 1;
+        const fixtures = state.fixtures.filter(match => match.divisionId === division.id);
+        const totalWeeks = Math.max(1, ...fixtures.map(match => match.week));
+        if (divisionWeek > totalWeeks) return null;
+        return {
+            division,
+            week: divisionWeek,
+            fixtures: fixtures.filter(match => match.week === divisionWeek)
+        };
+    }).filter(Boolean);
+    if (!schedules.length) {
+        showToast("Seluruh kasta telah menyelesaikan musim");
         return;
     }
 
-    const weekFixtures = divisionFixtures.filter(match => match.week === divisionWeek);
-    state.standings
-        .filter(team => team.divisionId === activeDivisionId)
-        .sort(compareTableStandings)
-        .forEach((team, index) => {
-            team.previousDivisionRank = index + 1;
-        });
+    schedules.forEach(schedule => {
+        state.standings
+            .filter(team => team.divisionId === schedule.division.id)
+            .sort(compareTableStandings)
+            .forEach((team, index) => {
+                team.previousDivisionRank = index + 1;
+            });
+    });
     updateGlobalRanking();
     state.standings.forEach(team => {
         team.previousGlobalRank = team.globalRank || 1;
     });
-    weekFixtures.forEach(match => {
-        const home = getTeam(match.homeId);
-        const away = getTeam(match.awayId);
-        const result = simulateDetailedMatch(home, away, true, divisionWeek);
-        const homeGoals = result.homeGoals;
-        const awayGoals = result.awayGoals;
 
-        match.played = true;
-        match.homeGoals = homeGoals;
-        match.awayGoals = awayGoals;
-        updateStandings(home, homeGoals, awayGoals);
-        updateStandings(away, awayGoals, homeGoals);
-        calculateRankingChange(home, away, homeGoals, awayGoals);
-        calculateRankingChange(away, home, awayGoals, homeGoals);
-        state.matchLog.push({
-            week: divisionWeek,
-            divisionId: match.divisionId,
-            homeId: home.id,
-            awayId: away.id,
-            homeShort: home.short,
-            awayShort: away.short,
-            homeGoals,
-            awayGoals,
-            events: result.events,
-            lineup: result.lineup,
-            aiDecision: result.aiDecision,
-            stats: result.stats
+    schedules.forEach(schedule => {
+        schedule.fixtures.forEach(match => {
+            const home = getTeam(match.homeId);
+            const away = getTeam(match.awayId);
+            const result = simulateDetailedMatch(home, away, true, schedule.week);
+            const homeGoals = result.homeGoals;
+            const awayGoals = result.awayGoals;
+
+            match.played = true;
+            match.homeGoals = homeGoals;
+            match.awayGoals = awayGoals;
+            updateStandings(home, homeGoals, awayGoals);
+            updateStandings(away, awayGoals, homeGoals);
+            calculateRankingChange(home, away, homeGoals, awayGoals);
+            calculateRankingChange(away, home, awayGoals, homeGoals);
+            state.matchLog.push({
+                week: schedule.week,
+                divisionId: match.divisionId,
+                homeId: home.id,
+                awayId: away.id,
+                homeShort: home.short,
+                awayShort: away.short,
+                homeGoals,
+                awayGoals,
+                events: result.events,
+                lineup: result.lineup,
+                aiDecision: result.aiDecision,
+                stats: result.stats
+            });
         });
     });
 
+    const fixturesByDivision = new Map(
+        schedules.map(schedule => [schedule.division.id, schedule.fixtures])
+    );
+    state.divisions.forEach(division => {
+        processClubWeeklyFinances(
+            division.id,
+            fixturesByDivision.get(division.id) || []
+        );
+    });
     state.federationBudget += 380;
     updateGlobalRanking();
-    state.divisionProgress[activeDivisionId] = divisionWeek + 1;
+    schedules.forEach(schedule => {
+        state.divisionProgress[schedule.division.id] = schedule.week + 1;
+    });
     state.week = Math.max(...Object.values(state.divisionProgress));
+    const progressAfter = getSeasonProgressRatio();
+    if (progressBefore < WINTER_TRANSFER_WINDOW_START &&
+        progressAfter >= WINTER_TRANSFER_WINDOW_START &&
+        !state.transferWindows?.winter) {
+        const transferReport = processAiTransferWindow("winter");
+        state.transferWindows = { ...state.transferWindows, winter: true };
+        recordTransferWindowReport(transferReport, "winter");
+    }
     saveState(false);
-    showToast(`${weekFixtures.length} pertandingan pekan ${divisionWeek} selesai`);
+    showToast(`Pekan berikutnya disimulasikan untuk ${schedules.length} kasta`);
     setView("overview");
+}
+
+function getPlayerTransferFee(player) {
+    const rating = Math.max(0, Math.min(100, Number(player.rating) || 0));
+    const potential = Math.max(rating, Number(player.potential) || rating);
+    const age = Math.max(16, Number(player.age) || 18);
+    return Math.max(100, Math.round(
+        200 + rating * 12 +
+        Math.max(0, potential - rating) * 8 +
+        Math.max(0, 24 - age) * 10 -
+        Math.max(0, age - 30) * 12
+    ));
+}
+
+function getPrizePoolDistribution(teamCount) {
+    const activeShares = PRIZE_RANK_SHARES.slice(0, Math.min(teamCount, PRIZE_RANK_SHARES.length));
+    const totalShares = activeShares.reduce((sum, share) => sum + share, 0);
+    return activeShares.map(share => share / totalShares);
+}
+
+function getConfiguredPrizePoolTotal() {
+    const basePool = Math.max(0, Math.min(1000000, Number(state.rules.prizePool) || 0));
+    return state.divisions.reduce((total, division) =>
+        total + Math.round(basePool * Math.pow(PRIZE_POOL_TIER_MULTIPLIER, division.id - 1)), 0);
+}
+
+function processLeaguePrizePool() {
+    const basePool = Math.max(0, Math.min(1000000, Number(state.rules.prizePool) || 0));
+    const divisions = state.divisions.map(division => {
+        const teams = state.standings
+            .filter(team => team.divisionId === division.id)
+            .sort(compareTableStandings);
+        const pool = Math.round(basePool * Math.pow(PRIZE_POOL_TIER_MULTIPLIER, division.id - 1));
+        return {
+            divisionId: division.id,
+            divisionName: division.name,
+            requestedPool: pool,
+            teams
+        };
+    });
+    const requestedTotal = divisions.reduce((sum, division) => sum + division.requestedPool, 0);
+    const available = Math.max(0, Number(state.federationBudget) || 0);
+    const fundedTotal = Math.min(requestedTotal, available);
+    const fundingRatio = requestedTotal > 0 ? fundedTotal / requestedTotal : 0;
+    let paidTotal = 0;
+
+    const report = {
+        season: state.season,
+        basePool,
+        requestedTotal,
+        fundedTotal,
+        funded: fundedTotal === requestedTotal,
+        divisions: divisions.map(division => {
+            const allocatablePool = Math.floor(division.requestedPool * fundingRatio);
+            const shares = division.requestedPool > 0
+                ? getPrizePoolDistribution(division.teams.length)
+                : [];
+            let divisionPaid = 0;
+            const awards = division.teams.slice(0, shares.length).map((team, index) => {
+                const amount = index === shares.length - 1
+                    ? allocatablePool - divisionPaid
+                    : Math.floor(allocatablePool * shares[index]);
+                divisionPaid += amount;
+                team.budget = (Number(team.budget) || 0) + amount;
+                const finance = normalizeClubFinance(team, state.season);
+                finance.prizeMoney += amount;
+                return {
+                    rank: index + 1,
+                    teamId: team.id,
+                    teamName: team.name,
+                    amount
+                };
+            });
+            paidTotal += divisionPaid;
+            return {
+                divisionId: division.divisionId,
+                divisionName: division.divisionName,
+                requestedPool: division.requestedPool,
+                paidPool: divisionPaid,
+                awards
+            };
+        })
+    };
+
+    report.fundedTotal = paidTotal;
+    report.funded = paidTotal === requestedTotal;
+    state.federationBudget = Math.max(0, available - paidTotal);
+    state.lastPrizePoolReport = report;
+    return report;
+}
+
+function processAiTransferWindow(windowName = getTransferWindowStatus().window) {
+    const report = {
+        open: ["summer", "winter"].includes(windowName),
+        window: windowName,
+        transfers: []
+    };
+    if (!report.open) return report;
+
+    const squadLimit = Math.max(11, Math.min(25, Number(state.rules.squadLimit) || 25));
+    const participatingTeams = new Set();
+    const transferredPlayers = new Set();
+    const groupLabels = {
+        GK: "penjaga gawang",
+        DEF: "pertahanan",
+        MID: "tengah",
+        FWD: "penyerangan"
+    };
+    const buyers = [...state.standings].sort((a, b) => {
+        const averageRating = team => team.squad.reduce((sum, player) =>
+            sum + (Number(player.rating) || 0), 0) / Math.max(1, team.squad.length);
+        return averageRating(a) - averageRating(b) || a.id - b.id;
+    });
+
+    buyers.forEach(buyer => {
+        if (participatingTeams.has(buyer.id) || buyer.squad.length >= squadLimit ||
+            (Number(buyer.budget) || 0) <= 0) return;
+
+        const weakestByGroup = Object.keys(SQUAD_DEPTH_TARGETS)
+            .map(group => {
+                const players = buyer.squad
+                    .filter(player => getPlayerPositionGroup(player.role) === group)
+                    .sort((a, b) => getPlayerSelectionScore(a) - getPlayerSelectionScore(b));
+                return players.length ? { group, player: players[0] } : null;
+            })
+            .filter(Boolean);
+        const offers = [];
+
+        state.standings.forEach(seller => {
+            if (seller.id === buyer.id || participatingTeams.has(seller.id) ||
+                seller.squad.length <= 11) return;
+
+            weakestByGroup.forEach(({ group, player: weakest }) => {
+                const sellersInGroup = seller.squad.filter(player =>
+                    getPlayerPositionGroup(player.role) === group)
+                    .sort((a, b) =>
+                        getPlayerSelectionScore(b) - getPlayerSelectionScore(a) ||
+                        (Number(b.rating) || 0) - (Number(a.rating) || 0)
+                    );
+                sellersInGroup.forEach(player => {
+                    if (transferredPlayers.has(player.id) ||
+                        (Number(player.rating) || 0) < (Number(weakest.rating) || 0) + 3) return;
+                    const fee = getPlayerTransferFee(player);
+                    if ((Number(buyer.budget) || 0) < fee) return;
+                    const weeklyWage = Number.isFinite(Number(player.weeklyWage))
+                        ? Math.max(0, Number(player.weeklyWage))
+                        : calculatePlayerWeeklyWage(player);
+                    const salaryCap = Math.max(0, Number(state.rules.salaryCap) || 0);
+                    if (getTeamWeeklyPayroll(buyer) + weeklyWage > salaryCap) return;
+                    offers.push({
+                        seller,
+                        player,
+                        weakest,
+                        group,
+                        fee,
+                        improvement: getPlayerSelectionScore(player) - getPlayerSelectionScore(weakest)
+                    });
+                });
+            });
+        });
+
+        offers.sort((a, b) =>
+            b.improvement - a.improvement ||
+            (Number(b.player.rating) || 0) - (Number(a.player.rating) || 0) ||
+            a.fee - b.fee ||
+            String(a.player.id).localeCompare(String(b.player.id))
+        );
+        const offer = offers[0];
+        if (!offer) return;
+
+        offer.seller.squad = offer.seller.squad.filter(player => player !== offer.player);
+        buyer.squad.push(offer.player);
+        buyer.budget = (Number(buyer.budget) || 0) - offer.fee;
+        offer.seller.budget = (Number(offer.seller.budget) || 0) + offer.fee;
+        const buyerFinance = normalizeClubFinance(buyer, state.season);
+        const sellerFinance = normalizeClubFinance(offer.seller, state.season);
+        buyerFinance.transferExpenses += offer.fee;
+        sellerFinance.transferIncome += offer.fee;
+        participatingTeams.add(buyer.id);
+        participatingTeams.add(offer.seller.id);
+        transferredPlayers.add(offer.player.id);
+        calculateTeamRatings(buyer);
+        calculateTeamRatings(offer.seller);
+        report.transfers.push({
+            playerId: offer.player.id,
+            playerName: offer.player.name,
+            role: offer.player.role,
+            rating: offer.player.rating,
+            fromTeamId: offer.seller.id,
+            fromTeamName: offer.seller.name,
+            toTeamId: buyer.id,
+            toTeamName: buyer.name,
+            fee: offer.fee,
+            window: windowName === "summer" ? "Musim panas" : "Musim dingin",
+            reason: `Memperkuat lini ${groupLabels[offer.group]} berdasarkan OVR dan kebutuhan skuad.`
+        });
+    });
+
+    return report;
+}
+
+function recordTransferWindowReport(report, windowName) {
+    if (!state.lastPlayerLifecycle) {
+        state.lastPlayerLifecycle = {
+            season: state.season,
+            clubs: [],
+            retirements: [],
+            growthCount: 0,
+            declineCount: 0,
+            transfers: []
+        };
+    }
+    if (!Array.isArray(state.lastPlayerLifecycle.transfers)) {
+        state.lastPlayerLifecycle.transfers = [];
+    }
+    state.lastPlayerLifecycle.transfers.push(...report.transfers);
+    state.lastPlayerLifecycle.transferWindowOpen = true;
+    state.lastPlayerLifecycle.transferWindows = {
+        ...(state.lastPlayerLifecycle.transferWindows || {}),
+        [windowName]: true
+    };
 }
 
 function startNextSeason() {
@@ -2615,13 +3431,22 @@ function startNextSeason() {
     if (!confirm(`Lanjutkan ke musim ${getNextSeason(state.season)} dengan hasil promosi dan play-off yang sudah ditampilkan? Klasemen dan jadwal akan diatur ulang.`)) return;
 
     const seasonArchive = archiveCurrentSeason();
+    const prizePoolReport = processLeaguePrizePool();
+    seasonArchive.prizePool = prizePoolReport;
+    seasonArchive.clubFinances = buildSeasonFinanceRecords();
+    seasonArchive.divisions.forEach(division => {
+        division.standings.forEach(archivedTeam => {
+            const team = state.standings.find(item => item.id === archivedTeam.id);
+            if (team) archivedTeam.budget = team.budget;
+        });
+    });
+
     state.pendingSeasonTransition.movements.forEach(movement => {
         const team = getTeam(movement.teamId);
         if (team) team.divisionId = movement.to;
     });
 
     state.lastPlayerLifecycle = processPlayerSeasonLifecycle();
-    seasonArchive.playerLifecycle = state.lastPlayerLifecycle;
     state.lastPlayerLifecycle.retirements.forEach(retirement => {
         state.playerRetirementHistory.push(retirement);
     });
@@ -2636,6 +3461,14 @@ function startNextSeason() {
         });
     });
     state.season = getNextSeason(state.season);
+    state.standings.forEach(team => {
+        team.sponsorIncome = calculateWeeklySponsorIncome(team);
+        team.finance = createClubFinanceLedger(state.season, team.budget);
+    });
+    state.transferWindows = { summer: false, winter: false };
+    const transferReport = processAiTransferWindow("summer");
+    state.transferWindows.summer = true;
+    recordTransferWindowReport(transferReport, "summer");
 
     const standings = state.standings.map(team => ({
         ...team,
@@ -2708,6 +3541,10 @@ function archiveCurrentSeason() {
         season: state.season,
         champion: divisions.find(division => division.id === 1)?.champion || null,
         divisions,
+        transfers: (state.lastPlayerLifecycle?.transfers || [])
+            .map(transfer => ({ ...transfer })),
+        transferWindows: { ...(state.transferWindows || {}) },
+        transferWindowOpen: Boolean(state.lastPlayerLifecycle?.transferWindowOpen),
         movements: movements.map(movement => ({ ...movement })),
         playoffs: playoffs.map(playoff => ({
             ...playoff,
@@ -2725,6 +3562,7 @@ function archiveCurrentSeason() {
             age: player.age,
             rating: player.rating,
             potential: player.potential,
+            weeklyWage: player.weeklyWage || 0,
             appearances: player.appearances || 0,
             goals: player.goals || 0,
             assists: player.assists || 0,
@@ -2732,6 +3570,8 @@ function archiveCurrentSeason() {
             yellowCards: player.yellowCards || 0,
             redCards: player.redCards || 0
         }))),
+        clubFinances: buildSeasonFinanceRecords(),
+        prizePool: null,
         matches: state.matchLog.map(match => ({
             week: match.week,
             divisionId: match.divisionId,
@@ -2879,6 +3719,7 @@ function createGeneratedPlayer(team, role, age) {
         fitness: 92,
         age: age || (16 + Math.floor(seededValue(seed + 4) * 3)),
         potential,
+        weeklyWage: calculatePlayerWeeklyWage({ rating, potential }),
         retirementAge: 36 + Math.floor(seededValue(seed + 5) * 4),
         lastSeasonChange: 0,
         goals: 0,
@@ -2913,6 +3754,111 @@ function getRoleForSquadDepthNeed(squad) {
         )[0];
 }
 
+function getPlayerDevelopmentLeaderRanks() {
+    const playersByDivision = new Map();
+    state.standings.forEach(team => {
+        const players = playersByDivision.get(team.divisionId) || [];
+        players.push(...team.squad);
+        playersByDivision.set(team.divisionId, players);
+    });
+
+    const ranks = new Map();
+    const categories = [
+        { id: "goals", eligible: () => true },
+        { id: "assists", eligible: () => true },
+        { id: "cleanSheets", eligible: player => player.role === "GK" }
+    ];
+    playersByDivision.forEach(players => {
+        categories.forEach(category => {
+            const ordered = players
+                .filter(player =>
+                    category.eligible(player) && (Number(player[category.id]) || 0) > 0)
+                .sort((a, b) =>
+                    (Number(b[category.id]) || 0) - (Number(a[category.id]) || 0) ||
+                    (Number(b.appearances) || 0) - (Number(a.appearances) || 0) ||
+                    (Number(b.rating) || 0) - (Number(a.rating) || 0)
+                );
+            let previousValue = null;
+            let rank = 0;
+            ordered.forEach((player, index) => {
+                const value = Number(player[category.id]) || 0;
+                if (value !== previousValue) rank = index + 1;
+                const playerRanks = ranks.get(player.id) || {};
+                playerRanks[category.id] = rank;
+                ranks.set(player.id, playerRanks);
+                previousValue = value;
+            });
+        });
+    });
+    return ranks;
+}
+
+function calculatePlayerSeasonDevelopment(player, team, leaderRanks) {
+    const age = player.age;
+    const appearances = Math.max(0, Number(player.appearances) || 0);
+    const matchesPlayed = Math.max(1, Number(team.p) || appearances);
+    const participation = Math.min(1, appearances / matchesPlayed);
+    const goals = Math.max(0, Number(player.goals) || 0);
+    const assists = Math.max(0, Number(player.assists) || 0);
+    const cleanSheets = Math.max(0, Number(player.cleanSheets) || 0);
+    const yellowCards = Math.max(0, Number(player.yellowCards) || 0);
+    const redCards = Math.max(0, Number(player.redCards) || 0);
+    const isGoalkeeper = player.role === "GK";
+    const isDefender = ["CB", "RB", "LB"].includes(player.role);
+    const isMidfielder = ["CM", "AM"].includes(player.role);
+    const profile = isGoalkeeper
+        ? { goals: 0.2, assists: 0.4, cleanSheets: 4.5, expected: 0.8 }
+        : isDefender
+            ? { goals: 1.2, assists: 1.5, cleanSheets: 3, expected: 0.7 }
+            : isMidfielder
+                ? { goals: 2.7, assists: 3.5, cleanSheets: 0.2, expected: 0.7 }
+                : { goals: 4.5, assists: 2.1, cleanSheets: 0.1, expected: 0.8 };
+    const weightedContribution =
+        (goals * profile.goals + assists * profile.assists + cleanSheets * profile.cleanSheets) /
+        matchesPlayed;
+    const performanceImpact = weightedContribution - profile.expected * participation;
+    const ageBase = age <= 20 ? 1.1
+        : age <= 23 ? 0.75
+            : age <= 26 ? 0.25
+                : age <= 29 ? -0.1
+                    : age <= 32 ? -0.7
+                        : -1 - (age - 32) * 0.22;
+    const potentialGap = Number(player.potential) - Number(player.rating);
+    const potentialInfluence = potentialGap * (0.015 + participation * 0.045);
+    const participationInfluence = participation * 0.55 - (1 - participation) * 0.35;
+    const playerRanks = leaderRanks.get(player.id) || {};
+    const rankBonus = rank => rank === 1 ? 1.5 : rank === 2 ? 0.75 : rank === 3 ? 0.4 : 0;
+    const recognitionBonus = (
+        rankBonus(playerRanks.goals) +
+        rankBonus(playerRanks.assists) +
+        rankBonus(isGoalkeeper ? playerRanks.cleanSheets : 0)
+    ) * participation;
+    const disciplinePenalty = yellowCards * 0.04 + redCards * 0.2;
+    const change = Math.round(
+        ageBase +
+        potentialInfluence +
+        participationInfluence +
+        performanceImpact +
+        recognitionBonus -
+        disciplinePenalty
+    );
+
+    const reasons = [];
+    if (playerRanks.goals === 1) reasons.push("pencetak gol terbanyak");
+    else if (playerRanks.goals > 1 && playerRanks.goals <= 3) reasons.push("3 besar pencetak gol");
+    if (playerRanks.assists === 1) reasons.push("assist terbanyak");
+    else if (playerRanks.assists > 1 && playerRanks.assists <= 3) reasons.push("3 besar assist");
+    if (isGoalkeeper && playerRanks.cleanSheets === 1) reasons.push("clean sheet terbanyak");
+    if (participation >= 0.75) reasons.push("tampil rutin");
+    else if (participation < 0.25) reasons.push("minim penampilan");
+    if (redCards > 0 || yellowCards > 0) reasons.push("catatan kartu");
+
+    return {
+        change,
+        reason: reasons.slice(0, 3).join(", ") || "usia, potensi, dan kontribusi musim ini"
+    };
+}
+
 function processPlayerSeasonLifecycle() {
     const squadLimit = Math.max(11, Math.min(25, Number(state.rules.squadLimit) || 25));
     const targetSquadSize = Math.min(
@@ -2926,6 +3872,7 @@ function processPlayerSeasonLifecycle() {
         growthCount: 0,
         declineCount: 0
     };
+    const leaderRanks = getPlayerDevelopmentLeaderRanks();
 
     state.standings.forEach(team => {
         const clubReport = {
@@ -2939,7 +3886,10 @@ function processPlayerSeasonLifecycle() {
         const retiredPlayers = [];
         team.squad.forEach(player => {
             player.age = Number(player.age) || 18;
-            player.potential = Math.max(player.rating, Number(player.potential) || player.rating);
+            const potential = Number(player.potential);
+            player.potential = Number.isFinite(potential)
+                ? Math.max(0, Math.min(100, potential))
+                : player.rating;
             player.retirementAge = Number(player.retirementAge) || 36;
             player.age += 1;
             player.lastSeasonChange = 0;
@@ -2949,11 +3899,8 @@ function processPlayerSeasonLifecycle() {
             }
 
             const previousRating = player.rating;
-            if (player.age <= 23 && player.rating < player.potential && Math.random() < 0.7) {
-                player.rating = Math.min(player.potential, player.rating + 1);
-            } else if (player.age >= 30 && player.rating > 55 && Math.random() < 0.5) {
-                player.rating -= 1;
-            }
+            const development = calculatePlayerSeasonDevelopment(player, team, leaderRanks);
+            player.rating = Math.max(0, Math.min(100, previousRating + development.change));
             player.lastSeasonChange = player.rating - previousRating;
             player.fitness = Math.max(90, Number(player.fitness) || 92);
             if (player.lastSeasonChange > 0) {
@@ -2961,14 +3908,16 @@ function processPlayerSeasonLifecycle() {
                     name: player.name,
                     age: player.age,
                     from: previousRating,
-                    to: player.rating
+                    to: player.rating,
+                    reason: development.reason
                 });
             } else if (player.lastSeasonChange < 0) {
                 clubReport.declines.push({
                     name: player.name,
                     age: player.age,
                     from: previousRating,
-                    to: player.rating
+                    to: player.rating,
+                    reason: development.reason
                 });
             }
         });
@@ -3211,8 +4160,9 @@ function createPromotionAndRelegationPlan(rules) {
                 setMovement(team, rule.lowerDivisionId, "Degradasi langsung");
             });
 
-            const lowerIndex = rule.crossPlayoffPosition - 1;
-            const upperIndex = upperTeams.length - rule.crossPlayoffPosition;
+            const crossPlayoffPosition = getCrossPlayoffPosition(rule);
+            const lowerIndex = crossPlayoffPosition - 1;
+            const upperIndex = upperTeams.length - crossPlayoffPosition;
             const lowerCandidate = lowerTeams[lowerIndex];
             const upperCandidate = upperTeams[upperIndex];
             if (lowerCandidate && upperCandidate &&
